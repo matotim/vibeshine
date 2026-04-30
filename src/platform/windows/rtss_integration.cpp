@@ -7,6 +7,7 @@
 
   // standard includes
   #include <array>
+  #include <cmath>
   #include <cstdio>
   #include <cwchar>
   #include <filesystem>
@@ -846,7 +847,50 @@ namespace platf {
     return ensure_rtss_running(g_rtss_root);
   }
 
-  bool rtss_streaming_start(int fps) {
+  /**
+   * Convert a (possibly fractional) FPS value to a numerator/denominator pair
+   * suitable for RTSS FramerateLimit and LimitDenominator fields.
+   * Examples: 60.0 -> (60, 1), 59.94 -> (60000, 1001), 29.97 -> (30000, 1001)
+   */
+  static std::pair<int, int> fps_to_fraction(double fps) {
+    if (fps <= 0.0) {
+      return {0, 1};
+    }
+
+    // If it's effectively an integer, use denominator 1
+    int rounded = static_cast<int>(fps + 0.5);
+    if (std::abs(fps - rounded) < 0.001) {
+      return {rounded, 1};
+    }
+
+    // Check common NTSC-style fractions (X * 1000/1001)
+    // e.g. 59.94 = 60000/1001, 29.97 = 30000/1001, 23.976 = 24000/1001
+    double candidate_num = fps * 1001.0;
+    int candidate_num_rounded = static_cast<int>(candidate_num + 0.5);
+    double reconstructed = static_cast<double>(candidate_num_rounded) / 1001.0;
+    if (std::abs(fps - reconstructed) < 0.001) {
+      return {candidate_num_rounded, 1001};
+    }
+
+    // General case: multiply to get 3 decimal places of precision
+    // fps = numerator / denominator, use denominator = 1000
+    int numerator = static_cast<int>(fps * 1000.0 + 0.5);
+    int denominator = 1000;
+
+    // Simplify by GCD
+    auto gcd = [](int a, int b) {
+      while (b != 0) {
+        int t = b;
+        b = a % b;
+        a = t;
+      }
+      return a;
+    };
+    int g = gcd(numerator, denominator);
+    return {numerator / g, denominator / g};
+  }
+
+  bool rtss_streaming_start(double fps) {
     g_limit_active = false;
     g_settings_dirty = false;
     g_flags_modified = false;
@@ -890,9 +934,8 @@ namespace platf {
       g_original_flags.reset();
     }
 
-    // Compute denominator and scaled limit (we have integer fps, so denominator=1)
-    int current_denominator = 1;
-    int scaled_limit = fps;
+    // Compute denominator and scaled limit from (possibly fractional) fps
+    auto [scaled_limit, current_denominator] = fps_to_fraction(fps);
 
     // Update LimitDenominator in Global profile and remember previous value
     g_original_denominator = set_limit_denominator(g_rtss_root, current_denominator);
@@ -1008,7 +1051,7 @@ namespace platf {
     return g_limit_active;
   }
 
-  bool rtss_streaming_refresh(int fps) {
+  bool rtss_streaming_refresh(double fps) {
     if (!config::frame_limiter.enable) {
       return false;
     }
@@ -1046,7 +1089,7 @@ namespace platf {
       }
     }
 
-    int current_denominator = 1;
+    auto [scaled_limit, current_denominator] = fps_to_fraction(fps);
     auto old_den = set_limit_denominator(g_rtss_root, current_denominator);
     if (old_den.has_value() && *old_den != current_denominator) {
       if (!g_original_denominator.has_value()) {
@@ -1094,7 +1137,6 @@ namespace platf {
       }
     }
 
-    int scaled_limit = fps;
     bool applied_limit = false;
     if (g_hooks) {
       set_profile_property_int("FramerateLimit", scaled_limit);

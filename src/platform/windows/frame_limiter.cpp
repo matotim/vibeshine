@@ -28,7 +28,7 @@ namespace platf {
     bool g_nvcp_started = false;
     bool g_gen1_framegen_fix_active = false;
     bool g_gen2_framegen_fix_active = false;
-    int g_last_effective_limit = 0;
+    double g_last_effective_limit = 0;
     bool g_prev_frame_limiter_enabled = false;
     std::string g_prev_frame_limiter_provider;
     bool g_prev_frame_limiter_provider_set = false;
@@ -170,7 +170,7 @@ namespace platf {
     const bool want_nv_vsync_override = (config::frame_limiter.disable_vsync || capture_fix_enabled) && nvidia_gpu_present && nvcp_ready;
 
     bool nvcp_already_invoked = false;
-    int effective_limit = (lossless_rtss_limit && *lossless_rtss_limit > 0) ? *lossless_rtss_limit : fps;
+    double effective_limit = (lossless_rtss_limit && *lossless_rtss_limit > 0) ? static_cast<double>(*lossless_rtss_limit) : static_cast<double>(fps);
     if (config::frame_limiter.fps_limit > 0) {
       effective_limit = config::frame_limiter.fps_limit;
     }
@@ -204,7 +204,7 @@ namespace platf {
 
         if (provider == frame_limiter_provider::nvidia_control_panel) {
           bool ok = frame_limiter_nvcp::streaming_start(
-            effective_limit,
+            static_cast<int>(effective_limit + 0.5),
             true,
             false,
             want_nv_vsync_override,
@@ -244,7 +244,7 @@ namespace platf {
 
     if ((want_disable_nv_frame_limit || want_nv_vsync_override || want_smooth_motion) && !nvcp_already_invoked) {
       bool nvcp_result = frame_limiter_nvcp::streaming_start(
-        effective_limit,
+        static_cast<int>(effective_limit + 0.5),
         false,
         want_disable_nv_frame_limit,
         want_nv_vsync_override,

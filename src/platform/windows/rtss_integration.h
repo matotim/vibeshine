@@ -23,11 +23,11 @@ namespace platf {
   };
 
   // Apply RTSS frame limit and related settings at stream start.
-  // fps is the integer client framerate.
-  bool rtss_streaming_start(int fps);
+  // fps is the client framerate (may be fractional, e.g. 59.94).
+  bool rtss_streaming_start(double fps);
 
   // Re-apply RTSS frame limit and related settings without resetting originals.
-  bool rtss_streaming_refresh(int fps);
+  bool rtss_streaming_refresh(double fps);
 
   // Restore any RTSS settings modified at stream start.
   // If keep_process_running is true, Sunshine leaves RTSS running for pause/resume scenarios.

@@ -156,7 +156,7 @@ jobs:
     name: Windows
     needs:
       - release-candidate
-    if: github.event_name != 'push' || needs.release-candidate.outputs.should_release == 'true'
+    #if: github.event_name != 'push' || needs.release-candidate.outputs.should_release == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/ci-windows.yml

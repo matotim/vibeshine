@@ -857,6 +857,7 @@ namespace {
         auto devices = enumerate_devices(display_device::DeviceEnumerationDetail::Minimal);
         std::set<std::string> valid_device_ids;
         std::vector<std::string> enumerated_devices;
+        std::vector<std::string> virtual_devices;
         for (const auto &d : devices) {
           const auto id = d.m_device_id.empty() ? d.m_display_name : d.m_device_id;
           if (!id.empty()) {
@@ -866,11 +867,29 @@ namespace {
             detail += ")";
             enumerated_devices.push_back(std::move(detail));
           }
+          if (is_virtual_display_device(d)) {
+            if (is_active_display_device(d) && !id.empty()) {
+              virtual_devices.push_back(id);
+            }
+            continue;
+          }
           if (!d.m_display_name.empty()) {
             if (!id.empty()) {
               valid_device_ids.insert(id);
             }
           }
+        }
+        if (!virtual_devices.empty()) {
+          std::string joined;
+          for (size_t i = 0; i < virtual_devices.size(); ++i) {
+            if (i > 0) {
+              joined += ", ";
+            }
+            joined += virtual_devices[i];
+          }
+          BOOST_LOG(warning) << "Skipping display snapshot save; active virtual display device(s) are present: ["
+                             << joined << "]";
+          return false;
         }
 
         if (!snapshot_exclusions.empty()) {
@@ -1146,6 +1165,7 @@ namespace {
         return out;
       };
       std::set<std::string> valid_devices_norm;
+      std::set<std::string> virtual_devices_norm;
       std::vector<std::string> filtered_out_excluded;
       std::vector<std::string> enumerated_devices;
       const auto exclusions = snapshot_exclusions_copy();
@@ -1161,11 +1181,31 @@ namespace {
         }
         enumerated_devices.push_back(id);
         auto norm = normalize_device_id(id);
+        if (is_virtual_display_device(d)) {
+          if (is_active_display_device(d)) {
+            virtual_devices_norm.insert(std::move(norm));
+          }
+          continue;
+        }
         if (!exclusions_norm.empty() && exclusions_norm.count(norm)) {
           filtered_out_excluded.push_back(id);
           continue;
         }
         valid_devices_norm.insert(std::move(norm));
+      }
+
+      if (!virtual_devices_norm.empty()) {
+        std::vector<std::string> snapshot_devices;
+        for (const auto &grp : snap.m_topology) {
+          snapshot_devices.insert(snapshot_devices.end(), grp.begin(), grp.end());
+        }
+        for (const auto &device_id : snapshot_devices) {
+          if (virtual_devices_norm.count(normalize_device_id(device_id))) {
+            BOOST_LOG(warning) << "Snapshot load rejected: snapshot contains active virtual display device "
+                               << device_id << " for path=" << path.string();
+            return std::nullopt;
+          }
+        }
       }
 
       if (valid_devices_norm.empty()) {
@@ -1382,6 +1422,54 @@ namespace {
         return static_cast<char>(std::tolower(c));
       });
       return id;
+    }
+
+    static bool contains_ci(const std::string &haystack, const std::string &needle) {
+      if (needle.empty()) {
+        return true;
+      }
+      if (haystack.size() < needle.size()) {
+        return false;
+      }
+      for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+          if (std::tolower(static_cast<unsigned char>(haystack[i + j])) !=
+              std::tolower(static_cast<unsigned char>(needle[j]))) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    static bool equals_ci(const std::string &lhs, const std::string &rhs) {
+      return lhs.size() == rhs.size() && contains_ci(lhs, rhs);
+    }
+
+    static bool is_virtual_display_device(const display_device::EnumeratedDevice &device) {
+      if (contains_ci(device.m_device_id, "SUDOVDA") ||
+          contains_ci(device.m_device_id, "SUDOMAKER") ||
+          contains_ci(device.m_display_name, "SUDOVDA") ||
+          contains_ci(device.m_display_name, "SUDOMAKER") ||
+          contains_ci(device.m_friendly_name, "SUDOVDA") ||
+          contains_ci(device.m_friendly_name, "SUDOMAKER")) {
+        return true;
+      }
+
+      if (equals_ci(device.m_friendly_name, "SudoMaker Virtual Display Adapter")) {
+        return true;
+      }
+
+      return device.m_edid && equals_ci(device.m_edid->m_manufacturer_id, "SMK");
+    }
+
+    static bool is_active_display_device(const display_device::EnumeratedDevice &device) {
+      return device.m_info.has_value() || !device.m_display_name.empty();
     }
 
     std::vector<std::string> snapshot_exclusions_copy() const {
@@ -2215,6 +2303,10 @@ namespace {
     // Track whether a revert/restore is currently pending
     std::atomic<bool> restore_requested {false};
     std::atomic<uint64_t> restore_cancel_generation {0};
+    // True after the restore loop has made at least one restore attempt that has
+    // not yet been confirmed. DISARM/SNAPSHOT_CURRENT from a later stream-start
+    // probe must not cancel or overwrite that restore baseline.
+    std::atomic<bool> restore_attempted_unconfirmed {false};
     // Guard: if a session restore succeeded recently, suppress Golden for a cooldown
     std::atomic<long long> last_session_restore_success_ms {0};
     // After a few consecutive confirmed session fallbacks, stop forcing golden
@@ -3148,6 +3240,8 @@ namespace {
         return false;
       }
 
+      restore_attempted_unconfirmed.store(true, std::memory_order_release);
+
       const bool golden_first = always_restore_from_golden.load(std::memory_order_acquire);
       if (!golden_first) {
         reset_pending_golden_session_fallbacks();
@@ -3326,6 +3420,7 @@ namespace {
       request_restore_cancel();
       event_pump.stop();
       event_pump_running.store(false, std::memory_order_release);
+      restore_attempted_unconfirmed.store(false, std::memory_order_release);
       reset_restore_backoff();
       restore_active_until_ms.store(0, std::memory_order_release);
       last_restore_event_ms.store(0, std::memory_order_release);
@@ -3372,6 +3467,7 @@ namespace {
     void clear_restore_origin() {
       restore_origin_epoch.store(0, std::memory_order_release);
       prefer_golden_if_current_missing.store(false, std::memory_order_release);
+      restore_attempted_unconfirmed.store(false, std::memory_order_release);
       reset_pending_golden_session_fallbacks();
     }
 
@@ -4812,8 +4908,17 @@ namespace {
       state.retry_apply_on_topology.store(false, std::memory_order_release);
       state.retry_revert_on_topology.store(false, std::memory_order_release);
     } else if (type == MsgType::Disarm) {
+      if (state.restore_requested.load(std::memory_order_acquire) &&
+          state.restore_attempted_unconfirmed.load(std::memory_order_acquire)) {
+        BOOST_LOG(info) << "DISARM command ignored because an unconfirmed restore attempt is still pending.";
+        return;
+      }
       state.disarm_restore_requests("DISARM command received");
     } else if (type == MsgType::SnapshotCurrent) {
+      if (state.restore_requested.load(std::memory_order_acquire)) {
+        BOOST_LOG(info) << "Skipping current session snapshot refresh while restore is pending.";
+        return;
+      }
       (void) state.refresh_current_snapshot_preserving_previous("snapshot-only");
     } else if (type == MsgType::Ping) {
       state.record_heartbeat_ping();
@@ -5122,7 +5227,11 @@ int main(int argc, char *argv[]) {
     }
 
     const auto connection_epoch = state.begin_connection_epoch();
-    state.stop_restore_polling();
+    // Do not cancel restore polling merely because Sunshine connected. Stream start
+    // often opens the helper first for SNAPSHOT_CURRENT/DISARM probes; cancelling
+    // here can strand a prior, unconfirmed restore when a physical monitor is
+    // present but its input is switched away. APPLY/DISARM handlers decide
+    // explicitly whether a restore should be superseded.
     state.begin_heartbeat_monitoring();
 
     // Reset and start per-connection command worker so IPC stays responsive even during heavy display work.

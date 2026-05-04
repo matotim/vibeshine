@@ -4,311 +4,355 @@ permissions: {}
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - vibe
+      - main
+      - master
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
 jobs:
-  github-env:
-    name: GitHub Env Debug
+  release-candidate:
+    name: Release candidate
     permissions:
       contents: read
-    uses: LizardByte/.github/.github/workflows/__call-github-env.yml@master
-
-  release-setup:
-    name: Release Setup
+    runs-on: ubuntu-latest
     outputs:
-      publish_release: ${{ steps.release-setup.outputs.publish_release }}
-      release_body: ${{ steps.release-setup.outputs.release_body }}
-      release_commit: ${{ steps.release-setup.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.release-setup.outputs.release_generate_release_notes }}
-      release_tag: ${{ steps.release-setup.outputs.release_tag }}
-      release_version: ${{ steps.release-setup.outputs.release_version }}
+      release_commit: ${{ steps.release-candidate.outputs.release_commit }}
+      release_version: ${{ steps.release-candidate.outputs.release_version }}
+      should_release: ${{ steps.release-candidate.outputs.should_release }}
+      tag_name: ${{ steps.release-candidate.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release candidate
+        id: release-candidate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          VERSION_RE = re.compile(r"^v?([0-9]+\.[0-9]+\.[0-9]+)([-.][0-9A-Za-z.-]+)?$")
+          REPO = os.environ["GITHUB_REPOSITORY"]
+
+          def run(*args, check=True):
+            return subprocess.run(args, check=check, text=True, capture_output=True).stdout.strip()
+
+          def output(**values):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for key, value in values.items():
+                print(f"{key}={value}", file=fh)
+
+          def skip(reason):
+            print(f"::notice::{reason}")
+            output(should_release="false", tag_name="", release_version="", release_commit="")
+            sys.exit(0)
+
+          def version_key(tag):
+            match = VERSION_RE.match(tag)
+            if not match:
+              return None
+
+            major, minor, patch = (int(part) for part in match.group(1).split("."))
+            suffix = (match.group(2) or "").lstrip("-.").lower()
+            suffix_parts = re.split(r"[-.]", suffix) if suffix else []
+            suffix_num = next((int(part) for part in suffix_parts if part.isdigit()), 0)
+
+            if not suffix or "stable" in suffix_parts:
+              suffix_rank = 40
+            elif "rc" in suffix_parts:
+              suffix_rank = 30
+            elif "beta" in suffix_parts:
+              suffix_rank = 20
+            elif "alpha" in suffix_parts:
+              suffix_rank = 10
+            else:
+              suffix_rank = 5
+
+            return (major, minor, patch, suffix_rank, suffix_num, suffix)
+
+          def release_notes_for(tag):
+            match = VERSION_RE.match(tag)
+            if not match:
+              return None
+
+            base_version = match.group(1)
+            release_version = tag[1:] if tag.startswith("v") else tag
+            for candidate in (
+              Path("release_notes") / f"{release_version}.md",
+              Path("release_notes") / f"{base_version}.md",
+              Path("release_notes") / f"{tag}.md",
+            ):
+              if candidate.is_file():
+                return str(candidate)
+            return None
+
+          event_name = os.environ["EVENT_NAME"]
+          if event_name != "push":
+            skip("Release gate only applies to push events.")
+
+          run("git", "fetch", "--force", "--tags")
+
+          release_tags = set(filter(None, run(
+            "gh", "api", "--paginate", f"repos/{REPO}/releases", "--jq", ".[].tag_name"
+          ).splitlines()))
+          release_versions = [version_key(tag) for tag in release_tags]
+          release_versions = [key for key in release_versions if key is not None]
+          current_release_version = max(release_versions) if release_versions else None
+
+          candidate_tags = run("git", "tag", "--list").splitlines()
+
+          valid_candidates = []
+          for tag in candidate_tags:
+            key = version_key(tag)
+            if key is None:
+              continue
+            if tag in release_tags:
+              print(f"Skipping {tag}: release already exists.")
+              continue
+            if current_release_version is not None and key <= current_release_version:
+              print(f"Skipping {tag}: not newer than the current release.")
+              continue
+            notes_file = release_notes_for(tag)
+            if notes_file is None:
+              print(f"Skipping {tag}: no matching release_notes file.")
+              continue
+            valid_candidates.append((key, tag, notes_file))
+
+          if not valid_candidates:
+            skip("No unreleased newer tag with matching release notes was found.")
+
+          _, tag_name, notes_file = max(valid_candidates, key=lambda item: item[0])
+          release_commit = run("git", "rev-list", "-n", "1", tag_name)
+          release_version = tag_name[1:] if tag_name.startswith("v") else tag_name
+
+          print(f"Release candidate: {tag_name} ({release_commit}) using {notes_file}")
+          output(
+            should_release="true",
+            tag_name=tag_name,
+            release_version=release_version,
+            release_commit=release_commit,
+          )
+          PY
+
+  build-windows:
+    name: Windows
+    needs:
+      - release-candidate
+    #if: github.event_name != 'push' || needs.release-candidate.outputs.should_release == 'true'
     permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      release_commit: ${{ needs.release-candidate.outputs.release_commit || github.sha }}
+      release_version: ${{ needs.release-candidate.outputs.release_version || '0.0.0' }}
+      symbol_product_name: Vibeshine
+      symbol_release_draft: true
+      symbol_release_prefix: shine
+    secrets:
+      symbol_token: ${{ secrets.SYMBOL_TOKEN }}
+
+  release:
+    name: Release
+    if: needs.release-candidate.outputs.should_release == 'true'
+    needs:
+      - release-candidate
+      - build-windows
+    permissions:
+      actions: read
       contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
-      - name: Release Setup
-        id: release-setup
-        uses: LizardByte/actions/actions/release_setup@6be4ea62064b64957aa880252fe353cd65bcdef7  # v2026.214.14019
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ needs.release-candidate.outputs.release_commit }}
 
-  build-docker:
-    name: Docker
-    needs: release-setup
-    permissions:
-      contents: read
-      packages: write
-    uses: LizardByte/.github/.github/workflows/__call-docker.yml@master
-    with:
-      docker_hub_username: ${{ vars.DOCKER_HUB_USERNAME }}
-      gh_bot_name: ${{ vars.GH_BOT_NAME }}
-      maximize_build_space: true
-      publish_release: ${{ needs.release-setup.outputs.publish_release }}
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_tag: ${{ needs.release-setup.outputs.release_tag }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-    secrets:
-      DOCKER_HUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
-      DOCKER_HUB_ACCESS_TOKEN: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      GH_BOT_TOKEN: ${{ secrets.GH_BOT_TOKEN }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-freebsd:
-    name: FreeBSD
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-freebsd.yml
-    with:
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-
-  build-homebrew:
-    name: Homebrew
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-homebrew.yml
-    with:
-      git_username: ${{ vars.GH_BOT_NAME }}
-      publish_release: ${{ needs.release-setup.outputs.publish_release }}
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_tag: ${{ needs.release-setup.outputs.release_tag }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-    secrets:
-      GH_TOKEN: ${{ secrets.GH_BOT_TOKEN }}
-      GIT_EMAIL: ${{ secrets.GH_BOT_EMAIL }}
-
-  build-linux:
-    name: Linux
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-linux.yml
-    with:
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-
-  build-archlinux:
-    name: Archlinux
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-archlinux.yml
-    with:
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-
-  build-linux-copr:
-    name: Linux Copr
-    if: github.event_name != 'push'  # releases are handled directly in ci-copr.yml
-    needs: release-setup
-    permissions:
-      contents: write  # needed to update releases
-    uses: ./.github/workflows/ci-copr.yml
-    secrets:
-      COPR_BETA_WEBHOOK_TOKEN: ${{ secrets.COPR_BETA_WEBHOOK_TOKEN }}
-      COPR_STABLE_WEBHOOK_TOKEN: ${{ secrets.COPR_STABLE_WEBHOOK_TOKEN }}
-      COPR_CLI_CONFIG: ${{ secrets.COPR_CLI_CONFIG }}
-
-  build-linux-flatpak:
-    name: Linux Flatpak
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-flatpak.yml
-    with:
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-
-  build-windows:
-    name: Windows
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-windows.yml
-    with:
-      release_commit: ${{ needs.release-setup.outputs.release_commit }}
-      release_version: ${{ needs.release-setup.outputs.release_version }}
-
-  bundle-analysis:
-    name: Bundle Analysis
-    needs: release-setup
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci-bundle.yml
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  coverage:
-    name: Coverage-${{ matrix.name }}
-    if: >-
-      always() &&
-      !cancelled() &&
-      startsWith(github.repository, 'LizardByte/')
-    needs:
-      - build-freebsd
-      - build-linux
-      - build-archlinux
-      - build-linux-flatpak
-      - build-homebrew
-      - build-windows
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: FreeBSD-14.3-amd64
-            coverage: true
-            pr: true
-          - name: FreeBSD-14.3-aarch64
-            coverage: true
-            pr: false
-          - name: Linux-AppImage
-            coverage: true
-            pr: true
-          - name: Archlinux
-            coverage: true
-            pr: true
-          - name: Homebrew-macos-14
-            coverage: false
-            pr: true
-          - name: Homebrew-macos-15
-            coverage: false
-            pr: true
-          - name: Homebrew-macos-26
-            coverage: false
-            pr: true
-          - name: Homebrew-ubuntu-22.04
-            coverage: true
-            pr: true
-          - name: Windows-AMD64
-            coverage: true
-            pr: true
-          - name: Windows-ARM64
-            coverage: true
-            pr: true
-    steps:
-      - name: Should run
-        id: should_run
+      - name: Resolve release metadata
+        id: release-metadata
+        env:
+          TAG_NAME: ${{ needs.release-candidate.outputs.tag_name }}
         run: |
-          should_run="false"
-          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ] || [ ${{ matrix.pr }} == "true" ]; then
-            should_run="true"
+          set -euo pipefail
+
+          if [[ "${TAG_NAME}" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)([-.][0-9A-Za-z.-]+)?$ ]]; then
+            base_version="${BASH_REMATCH[1]}"
+            release_version="${TAG_NAME#v}"
+          else
+            echo "::error::Unsupported release tag '${TAG_NAME}'. Use a version tag like 1.15.4, v1.15.4, or 1.15.4-beta.1."
+            exit 1
           fi
-          echo "SHOULD_RUN=${should_run}" >> "${GITHUB_OUTPUT}"
 
-      - name: Checkout
-        if: steps.should_run.outputs.SHOULD_RUN == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+          tag_lower="$(printf '%s' "${release_version}" | tr '[:upper:]' '[:lower:]')"
+          prerelease=false
+          channel=stable
+          if [[ "${tag_lower}" == *alpha* ]]; then
+            prerelease=true
+            channel=alpha
+          elif [[ "${tag_lower}" == *beta* ]]; then
+            prerelease=true
+            channel=beta
+          elif [[ "${tag_lower}" == *rc* ]]; then
+            prerelease=true
+            channel=rc
+          elif [[ "${tag_lower}" == *stable* ]]; then
+            prerelease=false
+            channel=stable
+          fi
 
-      - name: Download coverage artifact
-        if: steps.should_run.outputs.SHOULD_RUN == 'true'
+          if [[ "${prerelease}" == "true" ]]; then
+            make_latest=false
+          else
+            make_latest=true
+          fi
+
+          product_name="Vibeshine"
+
+          notes_file=""
+          for candidate in \
+            "release_notes/${release_version}.md" \
+            "release_notes/${base_version}.md" \
+            "release_notes/${TAG_NAME}.md"; do
+            if [[ -f "${candidate}" ]]; then
+              notes_file="${candidate}"
+              break
+            fi
+          done
+
+          if [[ -z "${notes_file}" ]]; then
+            echo "::error::Release notes file not found. Expected release_notes/${TAG_NAME}.md or release_notes/${release_version}.md"
+            exit 1
+          fi
+
+          echo "Using release notes: ${notes_file}"
+          echo "base_version=${base_version}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          echo "make_latest=${make_latest}" >> "${GITHUB_OUTPUT}"
+          echo "notes_file=${notes_file}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "product_name=${product_name}" >> "${GITHUB_OUTPUT}"
+          echo "release_version=${release_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download Windows artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
         with:
-          name: coverage-${{ matrix.name }}
-          path: _coverage
-
-      - name: Upload test coverage
-        if: |
-          steps.should_run.outputs.SHOULD_RUN == 'true'  &&
-          matrix.coverage != false
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de  # v5.5.2
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: ./_coverage/coverage.xml
-          report_type: coverage
-          flags: ${{ matrix.name }}
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-
-      - name: Upload test results
-        if: steps.should_run.outputs.SHOULD_RUN == 'true'
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de  # v5.5.2
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: ./_coverage/tests/test_results.xml
-          report_type: test_results
-          flags: ${{ matrix.name }}
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-
-  release:
-    name: Release
-    if:
-      needs.release-setup.outputs.publish_release == 'true' &&
-      startsWith(github.repository, 'LizardByte/')
-    needs:
-      - release-setup
-      - build-archlinux
-      - build-docker
-      - build-freebsd
-      - build-homebrew
-      - build-linux
-      - build-linux-flatpak
-      - build-windows
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
-        with:
+          name: build-Windows
           path: artifacts
-          pattern: build-*
-          merge-multiple: true
 
       - name: Debug artifacts
         run: ls -l artifacts
 
-      - name: Create/Update GitHub Release
-        uses: LizardByte/actions/actions/release_create@6be4ea62064b64957aa880252fe353cd65bcdef7  # v2026.214.14019
-        with:
-          allowUpdates: false
-          body: ${{ needs.release-setup.outputs.release_body }}
-          generateReleaseNotes: ${{ needs.release-setup.outputs.release_generate_release_notes }}
-          name: ${{ needs.release-setup.outputs.release_tag }}
-          prerelease: true
-          tag: ${{ needs.release-setup.outputs.release_tag }}
-          token: ${{ secrets.GH_BOT_TOKEN }}
-          virustotal_api_key: ${{ secrets.VIRUSTOTAL_API_KEY }}
+      - name: Create or update GitHub release
+        env:
+          BASE_VERSION: ${{ steps.release-metadata.outputs.base_version }}
+          CHANNEL: ${{ steps.release-metadata.outputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAKE_LATEST: ${{ steps.release-metadata.outputs.make_latest }}
+          NOTES_FILE: ${{ steps.release-metadata.outputs.notes_file }}
+          PRERELEASE: ${{ steps.release-metadata.outputs.prerelease }}
+          PRODUCT_NAME: ${{ steps.release-metadata.outputs.product_name }}
+          RELEASE_COMMIT: ${{ needs.release-candidate.outputs.release_commit }}
+          RELEASE_VERSION: ${{ steps.release-metadata.outputs.release_version }}
+          TAG_NAME: ${{ needs.release-candidate.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          release_title="v${RELEASE_VERSION}"
+          versioned_setup="artifacts/${PRODUCT_NAME}Setup-v${BASE_VERSION}-${CHANNEL}.exe"
 
-  release-homebrew-beta:
-    name: Release Homebrew Beta
-    if:
-      needs.release-setup.outputs.publish_release == 'true' &&
-      startsWith(github.repository, 'LizardByte/')
-    needs:
-      - release-setup
-      - build-homebrew
-      - release
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download homebrew artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
-        with:
-          name: beta-Homebrew
-          path: homebrew
+          mapfile -t setup_assets < <(find artifacts -maxdepth 1 -type f -name "${PRODUCT_NAME}Setup*.exe" | sort)
+          if (( ${#setup_assets[@]} != 1 )); then
+            echo "::error::Expected exactly one ${PRODUCT_NAME} setup artifact, found ${#setup_assets[@]}."
+            find artifacts -maxdepth 2 -type f -print >&2 || true
+            exit 1
+          fi
 
-      - name: Upload Homebrew Beta Formula
-        uses: LizardByte/actions/actions/release_homebrew@6be4ea62064b64957aa880252fe353cd65bcdef7  # v2026.214.14019
-        with:
-          actionlint_config: "---\n# empty config"
-          formula_file: ${{ github.workspace }}/homebrew/sunshine-beta.rb
-          git_email: ${{ secrets.GH_BOT_EMAIL }}
-          git_username: ${{ vars.GH_BOT_NAME }}
-          publish: true
-          token: ${{ secrets.GH_BOT_TOKEN }}
-          validate: false
+          if [[ "${setup_assets[0]}" != "${versioned_setup}" ]]; then
+            mv -f "${setup_assets[0]}" "${versioned_setup}"
+          fi
+
+          release_payload="$(
+            jq -n \
+              --arg tag_name "${TAG_NAME}" \
+              --arg target_commitish "${RELEASE_COMMIT}" \
+              --arg name "${release_title}" \
+              --rawfile body "${NOTES_FILE}" \
+              --argjson draft false \
+              --argjson prerelease "${PRERELEASE}" \
+              --arg make_latest "${MAKE_LATEST}" \
+              '{
+                tag_name: $tag_name,
+                target_commitish: $target_commitish,
+                name: $name,
+                body: $body,
+                draft: $draft,
+                prerelease: $prerelease,
+                make_latest: $make_latest
+              }'
+          )"
+
+          release_id="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\") | .id" |
+              head -n 1
+          )"
+
+          if [[ -n "${release_id}" ]]; then
+            release_json="$(
+              gh api \
+                --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+                --input - <<< "${release_payload}"
+            )"
+          else
+            release_json="$(
+              gh api \
+                --method POST \
+                "repos/${GITHUB_REPOSITORY}/releases" \
+                --input - <<< "${release_payload}"
+            )"
+          fi
+
+          release_id="$(jq -r '.id // empty' <<< "${release_json}")"
+          upload_url="$(jq -r '.upload_url // "" | split("{")[0]' <<< "${release_json}")"
+          if [[ -z "${release_id}" || -z "${upload_url}" ]]; then
+            echo "::error::Failed to resolve release id/upload URL for ${TAG_NAME}."
+            exit 1
+          fi
+
+          existing_asset_ids="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+              --jq '.[].id'
+          )"
+          while IFS= read -r asset_id; do
+            [[ -z "${asset_id}" ]] && continue
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
+          done <<< "${existing_asset_ids}"
+
+          for asset in artifacts/*; do
+            [[ -f "${asset}" ]] || continue
+            asset_name="$(basename "${asset}")"
+            encoded_asset_name="$(jq -rn --arg name "${asset_name}" '$name|@uri')"
+            gh api \
+              --method POST \
+              "${upload_url}?name=${encoded_asset_name}" \
+              -H "Content-Type: application/octet-stream" \
+              --input "${asset}" \
+              >/dev/null
+          done
